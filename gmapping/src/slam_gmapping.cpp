@@ -140,6 +140,7 @@ Initial map dimensions and resolution:
 #define MAP_IDX(sx, i, j) ((sx) * (j) + (i))
 
 /*默认构造函数*/
+//map 到 odom的transform
 SlamGMapping::SlamGMapping():
   map_to_odom_(tf::Transform(tf::createQuaternionFromRPY( 0, 0, 0 ), tf::Point(0, 0, 0 ))),
   laser_count_(0), private_nh_("~"), scan_filter_sub_(NULL), scan_filter_(NULL), transform_thread_(NULL)
@@ -316,12 +317,13 @@ void SlamGMapping::startLiveSlam()
   /*订阅激光数据
   三个做的其实就是tf下的消息过滤器，也就是订阅，缓存，转换坐标系，进行处理（回调函数中）
   先用对象scan_filter_sub_订阅了主题"scan"，以监听激光传感器的扫描值。然后用该订阅器构建消息过滤器， 
-  让它同时监听激光扫描消息和里程计坐标变换。最后注册回调函数SlamGMapping::laserCallback，
+  让它同时监听激光扫描消息和里程计坐标变换，只有转换数据存在才会调用。最后注册回调函数SlamGMapping::laserCallback，
   每当传感器的数据可以转换到目标坐标系上时，就调用该函数完成地图的更新。
   */
-  //句柄/topic/队列长度
+  //句柄/topic/队列长度，namespace/class template
   scan_filter_sub_ = new message_filters::Subscriber<sensor_msgs::LaserScan>(node_, "scan", 5);
   //这里用到subscribe函数，TransformListener，目标坐标系，queue
+  //保证激光数据可以转换到odom坐标系上，也就是说在这之前应该是tf tree里面有这个变换了
   scan_filter_ = new tf::MessageFilter<sensor_msgs::LaserScan>(*scan_filter_sub_, tf_, odom_frame_, 5);  
   //用到类方法作为回调函数
   scan_filter_->registerCallback(boost::bind(&SlamGMapping::laserCallback, this, _1));
@@ -413,6 +415,7 @@ void SlamGMapping::startReplay(const std::string & bag_fname, std::string scan_t
   bag.close();
 }
 /*不停地发布坐标转换，map to odom*/
+//map to odom已经在laserCallback中计算出来了，所以这里不停地发布
 void SlamGMapping::publishLoop(double transform_publish_period){
   if(transform_publish_period == 0)
     return;
@@ -442,20 +445,20 @@ SlamGMapping::~SlamGMapping()
     delete scan_filter_sub_;
 }
 
-/*t时刻激光中心位置在里程计坐标下的位姿,存储到gmap_pose*/
+/*t时刻激光中心位置在里程计坐标下的位姿,存储到gmap_pose，这里的里程计不是base，但是是会动的那一点，也就是机器人的起始点*/
 bool
 SlamGMapping::getOdomPose(GMapping::OrientedPoint& gmap_pose, const ros::Time& t)
 {
   
   // Get the pose of the centered laser at the right time
-  //激光中心位置的时间
+  //激光中心位置的时间，在initMapper里面已经初始化过了centered_laser_pose_，求出来了
   centered_laser_pose_.stamp_ = t;
   // Get the laser's pose that is centered
-  //得到激光中心位置在里程计坐标位姿
+  //得到激光中心位置在里程计坐标位姿，tf::<T>继承T，并增加了2个字段stamp_ frame_id_，其实加上Transform就和input、output类型一致
   tf::Stamped<tf::Transform> odom_pose;
   try
   {
-    //目标坐标系，本来坐标系下的位姿，目标坐标系下的位姿
+    //目标坐标系；input（geometry_msgs::PoseStamped[有stamped、fram_id,point+Quaternion(其实和tf::Stamped<tf::Transform>一样)]）: 本来坐标系下的位姿，output: 目标坐标系下的位姿
     tf_.transformPose(odom_frame_, centered_laser_pose_, odom_pose);
   }
   catch(tf::TransformException e)
@@ -477,17 +480,21 @@ bool
 SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
 {
   /*计算激光相对于基座的位姿*/
+  //激光的坐标系名称
   laser_frame_ = scan.header.frame_id;
   // Get the laser's pose, relative to base.
+  //tf::Stamped<tf::Pose>：需要stamped,frame_id,pose(平移+旋转)；tf::Stamped<T>
   tf::Stamped<tf::Pose> ident;
-  //旋转+平移矩阵
+  //旋转+平移矩阵，stamped,frame_id，等价于上面的定义
   tf::Stamped<tf::Transform> laser_pose;
+  //ident存储激光的初始原点，函数将全部设置为0，自己的坐标，肯定是0
   ident.setIdentity();
+  //额外的信息
   ident.frame_id_ = laser_frame_;
   ident.stamp_ = scan.header.stamp;
   try
   {
-    //转换前的存储在ident中，转换的位姿存储在laser_pose
+    //转换前的存储在ident中，隐含自己的坐标系，转换的位姿存储在laser_pose，此时包含目标坐标系，是激光原点在目标坐标系下的位姿。tf_是listener，假设tf tree上已经有转换的信息，这个实际机器人应该会发布
     tf_.transformPose(base_frame_, ident, laser_pose);
   }
   catch(tf::TransformException e)
@@ -497,16 +504,19 @@ SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
     return false;
   }
 
-  /*激光上方1m的点up在激光坐标下的位置*/
+  /*激光上方1m的点up在激光坐标下的位置，用于判断激光的安装方式*/
   // create a point 1m above the laser position and transform it into the laser-frame
-  //在基座base_frame坐标下
+  //用了上面转化的laser_pose，所以是在基座base_frame坐标下
+  //Vector3 = point(x,y,z) 
   tf::Vector3 v;
+  //这个v，其实现在坐标是base_link上的（0，0，1+z），如果laser_frame和base_frame处于同一个x，y上，那就是一样的，不是也是可以判断的
   v.setValue(0, 0, 1 + laser_pose.getOrigin().z());
+  //构造函数：Vector3,stamped,frame_id
   tf::Stamped<tf::Vector3> up(v, scan.header.stamp,
                                       base_frame_);
   try
   {
-    //转换为激光坐标下的位置
+    //将上面的点，转换为激光坐标下的位置，point=vector3
     tf_.transformPoint(laser_frame_, up, up);
     ROS_DEBUG("Z-Axis in sensor frame: %.3f", up.z());
   }
@@ -531,17 +541,23 @@ SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
   double angle_center = (scan.angle_min + scan.angle_max)/2;
   
   /*判断激光有没有上下颠倒，调整*/
+  //激光正常安装
   if (up.z() > 0)
   {
-    //激光有没有顺序相反
+    //激光有没有顺序相反，可能默认会错，所以还需要判断一下
     do_reverse_range_ = scan.angle_min > scan.angle_max;
+    //激光开始的位置应该是最左边，然后应该加上angle_center，才是中间的点在laser_frame_id坐标系下的坐标，RPY：欧拉角
+    //getOdompose会调用
     centered_laser_pose_ = tf::Stamped<tf::Pose>(tf::Transform(tf::createQuaternionFromRPY(0,0,angle_center),
                                                                tf::Vector3(0,0,0)), ros::Time::now(), laser_frame_);
     ROS_INFO("Laser is mounted upwards.");
   }
+  //激光上下颠倒
   else
   {
+    //判断有没有激光顺序相反
     do_reverse_range_ = scan.angle_min < scan.angle_max;
+    //默认左边为起始线，翻转之后在右边，所以是负的
     centered_laser_pose_ = tf::Stamped<tf::Pose>(tf::Transform(tf::createQuaternionFromRPY(M_PI,0,-angle_center),
                                                                tf::Vector3(0,0,0)), ros::Time::now(), laser_frame_);
     ROS_INFO("Laser is mounted upside down.");
@@ -549,6 +565,7 @@ SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
 
   /*激光的角度按相同间隔从小到大存储在laser_angles_中*/
   // Compute the angles of the laser from -x to x, basically symmetric and in increasing order
+  //保证角度的数组和激光数据数组一致
   laser_angles_.resize(scan.ranges.size());
   //对称，一开始为负，注意angle和range的区别
   // Make sure angles are started so that they are centered
@@ -558,12 +575,13 @@ SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
     laser_angles_[i]=theta;
     theta += std::fabs(scan.angle_increment);
   }
-
+  //没有负的
   ROS_DEBUG("Laser angles in laser-frame: min: %.3f max: %.3f inc: %.3f", scan.angle_min, scan.angle_max,
             scan.angle_increment);
+  //有负的 
   ROS_DEBUG("Laser angles in top-down centered laser-frame: min: %.3f max: %.3f inc: %.3f", laser_angles_.front(),
             laser_angles_.back(), std::fabs(scan.angle_increment));
-
+  //orientedpoint的类型：(x,y,theta)，并不是3*3的旋转矩阵，表示激光中心在laser_frame的位姿
   GMapping::OrientedPoint gmap_pose(0, 0, 0);
 
   // setting maxRange and maxUrange here so we can set a reasonable default
@@ -577,37 +595,40 @@ SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
   if(!private_nh_.getParam("maxUrange", maxUrange_))
     maxUrange_ = maxRange_;
 
-   /*初始化激光传感器模型对象RangeSensor*/
+   /*初始化激光传感器模型对象RangeSensor，gsp_laser_*/
   // The laser must be called "FLASER".
   // We pass in the absolute value of the computed angle increment, on the
   // assumption that GMapping requires a positive angle increment.  If the
   // actual increment is negative, we'll swap the order of ranges before
   // feeding each scan to GMapping.
   //类对象gsp_laser，描述扫描光束的各种物理性质
+  //https://github.com/ros-perception/openslam_gmapping/blob/master/include/gmapping/sensor/sensor_range/rangesensor.h
   gsp_laser_ = new GMapping::RangeSensor("FLASER",
-                                         gsp_laser_beam_count_,
-                                         fabs(scan.angle_increment),
-                                         gmap_pose,
+                                         gsp_laser_beam_count_,          //激光数据数组的size
+                                         fabs(scan.angle_increment),      
+                                         gmap_pose,                       
                                          0.0,
                                          maxRange_);
   ROS_ASSERT(gsp_laser_);
-  /*gsp_的成员函数smap*/
+  /*gsp_的成员函数smap，就是传感器映射，将名字与传感器map*/
   GMapping::SensorMap smap;
   //getName就是"FLASER"
   smap.insert(make_pair(gsp_laser_->getName(), gsp_laser_));
-  //gsp_是GridSlamProcessor类对象，建图引擎，调用setSensorMap配置激光传感器
+  //gsp_是GridSlamProcessor类对象，建图引擎，调用setSensorMap配置激光传感器，后面就可以通过map容器获取激光传感器
   gsp_->setSensorMap(smap);
 
-  /*里程计模型对象*/
+  /*里程计模型对象，似乎没有用到*/
   gsp_odom_ = new GMapping::OdometrySensor(odom_frame_);
   ROS_ASSERT(gsp_odom_);
 
-  /*getOdommPose设置激光初始位姿*/
+  /*getOdommPose设置激光初始位姿，其实就是将激光的中心位姿转换为odom坐标*/
   /// @todo Expose setting an initial pose
+  //initialPose
   GMapping::OrientedPoint initialPose;
   if(!getOdomPose(initialPose, scan.header.stamp))
   {
     ROS_WARN("Unable to determine inital pose of laser! Starting point will be set to zero.");
+    //不然激光的中心位置就定义为和odom坐标原点重合，是在odom坐标下
     initialPose = GMapping::OrientedPoint(0.0, 0.0, 0.0);
   }
   /*设置建图引擎的参数*/
@@ -645,10 +666,13 @@ SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
 }
 
 /*收集距离扫描数据和里程计数据，供建图引擎更新粒子集合*/
+//gmap_pose其实是输出
 bool
 SlamGMapping::addScan(const sensor_msgs::LaserScan& scan, GMapping::OrientedPoint& gmap_pose)
 {
-  //激光的坐标是否可以转换为里程计坐标
+  /*输入参数进行一些检查，防止程序发生意外的状况*/
+  //激光的中心坐标是否可以转换为里程计坐标，应该只是每次都测试一下原点，看看可不可以转换，gmap_pose是输出
+  //之前initMapper里面是初始化，这里是判断可不可以转换，因为后面要进行转换
   if(!getOdomPose(gmap_pose, scan.header.stamp))
      return false;
   //激光的数据size是否相等
@@ -690,9 +714,11 @@ SlamGMapping::addScan(const sensor_msgs::LaserScan& scan, GMapping::OrientedPoin
     }
   }
 
-  /*使用GMapping中的标准扫描读数对象reading*/
+  /*使用GMapping中的标准扫描读数对象reading，继承vector*/
   GMapping::RangeReading reading(scan.ranges.size(),
+                                //扫描的数据
                                  ranges_double,
+                                 //reading需要激光传感器对象
                                  gsp_laser_,
                                  scan.header.stamp.toSec());
 
@@ -701,6 +727,7 @@ SlamGMapping::addScan(const sensor_msgs::LaserScan& scan, GMapping::OrientedPoin
   //会对数组ranges_double进行深度拷贝，可以释放内存
   delete[] ranges_double;
   //添加里程计数据到reading
+  //gmap_pose是激光中心位置，其在odom坐标下的位置是会变化的，根据getOdomPose可以获得
   reading.setPose(gmap_pose);
 
   /*
@@ -734,7 +761,7 @@ SlamGMapping::laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
   //got_first_scan一开始只是声明，然后init()函数会被调用，设置为false
   if(!got_first_scan_)
   {
-    //只要满足initMapper的条件，就记为得到了first_scan，之后就不会再调用
+    //只有满足initMapper的条件，才可以对数据进行处理，才记为得到了first_scan，之后就不会再调用
     if(!initMapper(*scan))
       return;
     got_first_scan_ = true;
@@ -747,18 +774,20 @@ SlamGMapping::laserCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
   {
     ROS_DEBUG("scan processed");
     /*以最优粒子地图坐标为基准计算从激光雷达到地图之间的坐标变换,同时计算从里程计到激光雷达的坐标变换*/
-    //从粒子集合中挑选最优的粒子
+    //从粒子集合中挑选最优的粒子，mpose是激光在地图坐标下的位置，odom_pose是激光在odom下的位姿
     GMapping::OrientedPoint mpose = gsp_->getParticles()[gsp_->getBestParticleIndex()].pose;
     ROS_DEBUG("new best pose: %.3f %.3f %.3f", mpose.x, mpose.y, mpose.theta);
     ROS_DEBUG("odom pose: %.3f %.3f %.3f", odom_pose.x, odom_pose.y, odom_pose.theta);
     ROS_DEBUG("correction: %.3f %.3f %.3f", mpose.x - odom_pose.x, mpose.y - odom_pose.y, mpose.theta - odom_pose.theta);
-    //激光雷达到地图之间的坐标变换
+    //变换是已经存在了的
+    //激光雷达到地图之间的坐标变换，其实就是base_link to map，其实就是当前的激光原点位姿（x，y，theta）（在地图坐标上）以transform的形式表示出来， 是坐标变换，但是是已经存在那种，不是transformpose那种
+    //这是粒子滤波测出来的，是绝对的
     tf::Transform laser_to_map = tf::Transform(tf::createQuaternionFromRPY(0, 0, mpose.theta), tf::Vector3(mpose.x, mpose.y, 0.0)).inverse();
-    //从里程计到激光雷达的坐标变换
+    //从里程计到激光雷达的坐标变换, 其实就是odom to base_link
     tf::Transform odom_to_laser = tf::Transform(tf::createQuaternionFromRPY(0, 0, odom_pose.theta), tf::Vector3(odom_pose.x, odom_pose.y, 0.0));
     
-    /*原子操作计算地图到里程计*/
-    //在更新的时候对map_to_odom_加锁了，以保证更新过程是原子的
+    /*原子操作计算地图到里程计，坐标转换一般都这么计算*/
+    //在更新的时候对map_to_odom_加锁了，以保证更新过程是原子的，后面 map_to_odom 会被publish出去
     map_to_odom_mutex_.lock();
     map_to_odom_ = (odom_to_laser * laser_to_map).inverse();
     map_to_odom_mutex_.unlock();
@@ -806,7 +835,7 @@ SlamGMapping::updateMap(const sensor_msgs::LaserScan& scan)
   ROS_DEBUG("Update map");
   //加锁
   boost::mutex::scoped_lock map_lock (map_mutex_);
-  /*构建扫描器，配置参数*/
+  /*构建扫描器，配置参数，对建议分布进行采样时，考虑激光传感器的读数，提高准确度， 减少粒子数量*/
   GMapping::ScanMatcher matcher;
   //激光参数
   matcher.setLaserParameters(scan.ranges.size(), &(laser_angles_[0]),
@@ -821,7 +850,7 @@ SlamGMapping::updateMap(const sensor_msgs::LaserScan& scan)
   GMapping::GridSlamProcessor::Particle best =
           gsp_->getParticles()[gsp_->getBestParticleIndex()];
   
-  /*计算熵，通过发布器发布*/
+  /*计算熵，通过发布器发布，应该只是用来订阅*/
   std_msgs::Float64 entropy;
   //computePoseEntropy可以遍历粒子集合计算熵
   entropy.data = computePoseEntropy();
