@@ -140,7 +140,10 @@ Initial map dimensions and resolution:
 #define MAP_IDX(sx, i, j) ((sx) * (j) + (i))
 
 /*默认构造函数*/
-//map 到 odom的transform
+//初始化map 到 odom的transform
+//雷达计数器
+//调用系统时间随机初始化种子，是一种常用的方法
+//然后调用init完成初始化
 SlamGMapping::SlamGMapping():
   map_to_odom_(tf::Transform(tf::createQuaternionFromRPY( 0, 0, 0 ), tf::Point(0, 0, 0 ))),
   laser_count_(0), private_nh_("~"), scan_filter_sub_(NULL), scan_filter_(NULL), transform_thread_(NULL)
@@ -173,21 +176,27 @@ void SlamGMapping::init()
   // The library is pretty chatty
   //gsp_ = new GMapping::GridSlamProcessor(std::cerr);
   //创建建图引擎对象，每个粒子都有一个关于地图和机器人位姿的估计
+  //gsp_其实就是基本的GridFastSLAM算法的类对象， 也就是openslam里面的源码，用RBPF完成SLAM工作，
   gsp_ = new GMapping::GridSlamProcessor();
   ROS_ASSERT(gsp_);
-  //创建broadcaster对象，用于发布从地图到里程计的坐标变换map_to_odom_
+  //创建broadcaster对象tf_B，用于发布从地图到里程计的坐标变换map_to_odom_
   tfB_ = new tf::TransformBroadcaster();
   ROS_ASSERT(tfB_);
   //激光传感器和里程计传感器
+  //这里只是设置为null，后面在startLiveSlam中会新建一个对象
   gsp_laser_ = NULL;
   gsp_odom_ = NULL;
   //第一次扫描和建图初始化
+  //是否接收到了第一次的扫描数据
   got_first_scan_ = false;
+  //是否生成了地图
   got_map_ = false;
   
 
   /*初始化参数*/
   // Parameters used by our GMapping wrapper
+  //利用私有句柄private_nh_从参数服务器上请求，没有就设置默认值
+  //私有句柄可以通过getParam得到参数，因为launch文件中的node_name和私有句柄是一样的
   //处理的容忍度，接受到throttle_scans个scan，就进行更新
   if(!private_nh_.getParam("throttle_scans", throttle_scans_))
     throttle_scans_ = 1;
@@ -295,7 +304,8 @@ void SlamGMapping::init()
   //转换的间隔
   if(!private_nh_.getParam("tf_delay", tf_delay_))
     tf_delay_ = transform_publish_period_;
-
+  /*虽然init得到了参数和gsp_，但是没有在gsp_上生效，所以后面调用函数initMapper完成建图引擎的配置
+  这个操作会在startLiveSlam中调用lasercallback中被调用*/
 }
 
 
@@ -328,7 +338,7 @@ void SlamGMapping::startLiveSlam()
   //用到类方法作为回调函数
   scan_filter_->registerCallback(boost::bind(&SlamGMapping::laserCallback, this, _1));
   
-  /*创建一个线程，以transform_publish_period_为周期发布坐标变换*/
+  /*创建一个线程，以transform_publish_period_为周期发布坐标变换,map to odom*/
   transform_thread_ = new boost::thread(boost::bind(&SlamGMapping::publishLoop, this, transform_publish_period_));
   
 }
@@ -480,7 +490,7 @@ bool
 SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
 {
   /*计算激光相对于基座的位姿*/
-  //激光的坐标系名称
+  //激光传感器的坐标系名称
   laser_frame_ = scan.header.frame_id;
   // Get the laser's pose, relative to base.
   //tf::Stamped<tf::Pose>：需要stamped,frame_id,pose(平移+旋转)；tf::Stamped<T>
@@ -495,6 +505,7 @@ SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
   try
   {
     //转换前的存储在ident中，隐含自己的坐标系，转换的位姿存储在laser_pose，此时包含目标坐标系，是激光原点在目标坐标系下的位姿。tf_是listener，假设tf tree上已经有转换的信息，这个实际机器人应该会发布
+    //其实就是矩阵操作
     tf_.transformPose(base_frame_, ident, laser_pose);
   }
   catch(tf::TransformException e)
@@ -504,8 +515,9 @@ SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
     return false;
   }
 
-  /*激光上方1m的点up在激光坐标下的位置，用于判断激光的安装方式*/
+  /*在机器人坐标系下，在激光传感器上方1m的点up，转换到激光坐标下的位置，用于判断激光的安装方式*/
   // create a point 1m above the laser position and transform it into the laser-frame
+  //转来转去就是为了进行判断，所以不可以直接在激光传感器坐标下取点，这里激光传感器坐标应该是根据某种规则事先定好的，所以才有可能有负的情况
   //用了上面转化的laser_pose，所以是在基座base_frame坐标下
   //Vector3 = point(x,y,z) 
   tf::Vector3 v;
@@ -535,13 +547,13 @@ SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
                  up.z());
     return false;
   }
-  //激光数据数组的size
+  //激光数据数组（数据量）的size
   gsp_laser_beam_count_ = scan.ranges.size();
   //激光的中心位置
   double angle_center = (scan.angle_min + scan.angle_max)/2;
   
   /*判断激光有没有上下颠倒，调整*/
-  //激光正常安装
+  //激光正常安装，判断扫描方向
   if (up.z() > 0)
   {
     //激光有没有顺序相反，可能默认会错，所以还需要判断一下
@@ -552,7 +564,7 @@ SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
                                                                tf::Vector3(0,0,0)), ros::Time::now(), laser_frame_);
     ROS_INFO("Laser is mounted upwards.");
   }
-  //激光上下颠倒
+  //激光安装上下颠倒，判断扫描方向
   else
   {
     //判断有没有激光顺序相反
@@ -563,7 +575,8 @@ SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
     ROS_INFO("Laser is mounted upside down.");
   }
 
-  /*激光的角度按相同间隔从小到大存储在laser_angles_中*/
+  /*激光的角度按相同间隔从小到大存储在laser_angles_中，
+  根据扫描的数据长度和增长步长初始化雷达的扫描角度表laser_angles_*/
   // Compute the angles of the laser from -x to x, basically symmetric and in increasing order
   //保证角度的数组和激光数据数组一致
   laser_angles_.resize(scan.ranges.size());
@@ -582,6 +595,7 @@ SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
   ROS_DEBUG("Laser angles in top-down centered laser-frame: min: %.3f max: %.3f inc: %.3f", laser_angles_.front(),
             laser_angles_.back(), std::fabs(scan.angle_increment));
   //orientedpoint的类型：(x,y,theta)，并不是3*3的旋转矩阵，表示激光中心在laser_frame的位姿
+  //实际上就是里程计的位姿
   GMapping::OrientedPoint gmap_pose(0, 0, 0);
 
   // setting maxRange and maxUrange here so we can set a reasonable default
@@ -621,7 +635,8 @@ SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
   gsp_odom_ = new GMapping::OdometrySensor(odom_frame_);
   ROS_ASSERT(gsp_odom_);
 
-  /*getOdommPose设置激光初始位姿，其实就是将激光的中心位姿转换为odom坐标*/
+  /*getOdommPose设置激光初始位姿，其实就是将激光的中心位姿转换为odom坐标
+  不是里程计位姿的初始化，而是传感器在里程计坐标下的位姿，其实是机器人的初始位姿，在processScan里面会出现*/
   /// @todo Expose setting an initial pose
   //initialPose
   GMapping::OrientedPoint initialPose;
@@ -631,14 +646,14 @@ SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
     //不然激光的中心位置就定义为和odom坐标原点重合，是在odom坐标下
     initialPose = GMapping::OrientedPoint(0.0, 0.0, 0.0);
   }
-  /*设置建图引擎的参数*/
+  /*设置建图引擎的参数，其实就是参数服务器的一种设置方法*/
   //匹配模型参数
   gsp_->setMatchingParameters(maxUrange_, maxRange_, sigma_,
                               kernelSize_, lstep_, astep_, iterations_,
                               lsigma_, ogain_, lskip_);
-  //运动模型参数
+  //运动模型参数数据
   gsp_->setMotionModelParameters(srr_, srt_, str_, stt_);
-  //更新距离
+  //更新距离数据
   gsp_->setUpdateDistances(linearUpdate_, angularUpdate_, resampleThreshold_);
   //更新周期
   gsp_->setUpdatePeriod(temporalUpdate_);
@@ -666,13 +681,13 @@ SlamGMapping::initMapper(const sensor_msgs::LaserScan& scan)
 }
 
 /*收集距离扫描数据和里程计数据，供建图引擎更新粒子集合*/
-//gmap_pose其实是输出
+//gmap_pose其实是输出，里程计的累积位姿，
 bool
 SlamGMapping::addScan(const sensor_msgs::LaserScan& scan, GMapping::OrientedPoint& gmap_pose)
 {
   /*输入参数进行一些检查，防止程序发生意外的状况*/
   //激光的中心坐标是否可以转换为里程计坐标，应该只是每次都测试一下原点，看看可不可以转换，gmap_pose是输出
-  //之前initMapper里面是初始化，这里是判断可不可以转换，因为后面要进行转换
+  //之前initMapper里面是初始化，而且是原点之间，这里是判断可不可以转换，因为后面要进行转换
   if(!getOdomPose(gmap_pose, scan.header.stamp))
      return false;
   //激光的数据size是否相等
